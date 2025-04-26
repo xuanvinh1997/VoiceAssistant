@@ -326,6 +326,9 @@ public:
     // Initialize VAD with model path
     bool initializeVAD(const std::string& vadModelPath);
     
+    // Enable or disable VAD processing
+    bool enableVAD(bool enable);
+    
     // Start listening for audio
     bool start(std::function<void(const std::string&)> wakeWordCallback);
     
@@ -370,6 +373,11 @@ private:
     int silenceLimitFrames = 10; // Process for this many frames after silence
     int silenceFrameCount = 0;   // Counter for frames of silence
     
+    // Voice end delay mechanism
+    std::atomic<bool> voiceEndPending{false};
+    int voiceEndFrameCount = 0;
+    int voiceEndDelayFrames = 10; // 500ms at 16KHz with 512 sample frames (32ms * 16)
+
     // VAD context-related additions (based on reference implementation)
     static constexpr int vadContextSamples = 64; // For 16kHz, 64 samples as context
     int vadMinSilenceSamples = 1600; // 100ms at 16kHz

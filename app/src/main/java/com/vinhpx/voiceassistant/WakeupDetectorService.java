@@ -14,8 +14,11 @@ import com.vinhpx.voiceassistant.speech.SpeechRecognitionListener;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.IOException;
+import java.text.SimpleDateFormat;
 import java.util.ArrayList;
+import java.util.Date;
 import java.util.List;
+import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -29,6 +32,7 @@ public class WakeupDetectorService implements WakeupDetectorCallback {
     private static final int CHANNEL_CONFIG = AudioFormat.CHANNEL_IN_MONO;
     private static final int AUDIO_FORMAT = AudioFormat.ENCODING_PCM_16BIT;
     private static final int BUFFER_SIZE_FACTOR = 2; // Multiplier for minimum buffer size
+    private static final int MAX_SPEECH_DURATION_SAMPLES = SAMPLE_RATE * 30; // 30 seconds max
     
     private final List<WakeupDetectorCallback> callbacks = new ArrayList<>();
     private final List<SpeechRecognitionListener> speechListeners = new ArrayList<>();
@@ -41,6 +45,13 @@ public class WakeupDetectorService implements WakeupDetectorCallback {
     private short[] audioBuffer;
     private Thread recordingThread;
     
+    // Audio capture for speech recognition
+    private List<short[]> voiceActivityBuffer;
+    private boolean isCapturingVoiceActivity = false;
+    private boolean wakeWordDetectedDuringVoiceActivity = false;
+    private String detectedWakeWord = null;
+    private int capturedSamplesCount = 0;
+    
     // Azure Speech SDK recognizer
     private AzureSpeechRecognizer speechRecognizer;
     private String azureSubscriptionKey;
@@ -49,6 +60,11 @@ public class WakeupDetectorService implements WakeupDetectorCallback {
     
     // Add this field to store the last recognized speech text
     private String lastRecognizedText = null;
+    
+    // Add field for wake word detection timer
+//    private Handler wakeWordDetectionHandler = new Handler(Looper.getMainLooper());
+//    private Runnable wakeWordTimeoutRunnable;
+    private static final long WAKE_WORD_HOLD_TIME_MS = 1000; // 1 second
     
     /**
      * Create a new WakeupDetectorService
@@ -65,6 +81,9 @@ public class WakeupDetectorService implements WakeupDetectorCallback {
                 SAMPLE_RATE, CHANNEL_CONFIG, AUDIO_FORMAT);
         audioBuffer = new short[minBufferSize];
         
+        // Initialize buffer for voice activity
+        voiceActivityBuffer = new ArrayList<>();
+        
         Log.i(TAG, "WakeupDetectorService created with buffer size: " + minBufferSize);
     }
     
@@ -78,7 +97,6 @@ public class WakeupDetectorService implements WakeupDetectorCallback {
      */
     public boolean initialize(String melModelName, String embModelName, String[] wakeWordModelNames) {
         try {
-            // Copy model files to internal storage for native access
             String melModelPath = copyAssetToInternalStorage(melModelName);
             String embModelPath = copyAssetToInternalStorage(embModelName);
             
@@ -88,12 +106,35 @@ public class WakeupDetectorService implements WakeupDetectorCallback {
             }
             
             return detector.initialize(melModelPath, embModelPath, wakeWordModelPaths);
-        } catch (Exception e) {
-            Log.e(TAG, "Error initializing detector", e);
+        } catch (IOException e) {
+            Log.e(TAG, "Error initializing models", e);
             return false;
         }
     }
-
+    
+    /**
+     * Initialize the VAD (Voice Activity Detection) model
+     * 
+     * @param vadModelName Name of the VAD model file in assets
+     * @return true if initialization succeeded
+     */
+    public boolean initializeVAD(String vadModelName) {
+        try {
+            String vadModelPath = copyAssetToInternalStorage(vadModelName);
+            
+            Log.i(TAG, "Initializing VAD with model: " + vadModelName);
+            boolean result = detector.initializeVAD(vadModelPath);
+            if (result) {
+                Log.i(TAG, "VAD model initialized successfully");
+            } else {
+                Log.e(TAG, "Failed to initialize VAD model");
+            }
+            return result;
+        } catch (IOException e) {
+            Log.e(TAG, "Error initializing VAD model", e);
+            return false;
+        }
+    }
     
     /**
      * Configure Azure Speech Recognition
@@ -306,9 +347,109 @@ public class WakeupDetectorService implements WakeupDetectorCallback {
             int readSize = audioRecord.read(audioBuffer, 0, audioBuffer.length);
             
             if (readSize > 0) {
+                // Process audio for wake word detection
                 detector.processAudio(audioBuffer, readSize);
+                
+                // If we're in a voice activity session, store the audio for later processing
+                if (isCapturingVoiceActivity && capturedSamplesCount < MAX_SPEECH_DURATION_SAMPLES) {
+                    // Make a copy of the audio buffer to store
+                    short[] bufferCopy = new short[readSize];
+                    System.arraycopy(audioBuffer, 0, bufferCopy, 0, readSize);
+                    
+                    // Add to our voice activity buffer
+                    voiceActivityBuffer.add(bufferCopy);
+                    capturedSamplesCount += readSize;
+                }
             }
         }
+    }
+    
+    /**
+     * Get the last recognized text from speech recognition
+     * 
+     * @return The last recognized text, or null if none
+     */
+    public String getLastRecognizedText() {
+        return lastRecognizedText;
+    }
+    
+    /**
+     * Log text output using Android's Log system
+     * 
+     * @param text The text to log
+     * @param priority Log priority level (use constants from android.util.Log)
+     * @return true if logging succeeded
+     */
+    public boolean logTextOutput(String text, int priority) {
+        if (text == null || text.isEmpty()) {
+            return false;
+        }
+        
+        try {
+            // Format the log message with timestamp for better readability
+            String timestamp = new SimpleDateFormat("HH:mm:ss", Locale.US).format(new Date());
+            String logMessage = String.format("[%s] %s", timestamp, text);
+            
+            // Log with the specified priority
+            switch (priority) {
+                case Log.VERBOSE:
+                    Log.v(TAG, logMessage);
+                    break;
+                case Log.DEBUG:
+                    Log.d(TAG, logMessage);
+                    break;
+                case Log.INFO:
+                    Log.i(TAG, logMessage);
+                    break;
+                case Log.WARN:
+                    Log.w(TAG, logMessage);
+                    break;
+                case Log.ERROR:
+                    Log.e(TAG, logMessage);
+                    break;
+                default:
+                    Log.i(TAG, logMessage); // Default to INFO level
+            }
+            return true;
+        } catch (Exception e) {
+            Log.e(TAG, "Error logging text output", e);
+            return false;
+        }
+    }
+    
+    /**
+     * Log text output using Android's Log system with INFO priority
+     * 
+     * @param text The text to log
+     * @return true if logging succeeded
+     */
+    public boolean logTextOutput(String text) {
+        return logTextOutput(text, Log.INFO);
+    }
+    
+    /**
+     * Log the last recognized text from speech recognition with INFO priority
+     * 
+     * @return true if logging succeeded, false if there was no text to log
+     */
+    public boolean logLastRecognizedText() {
+        if (lastRecognizedText != null && !lastRecognizedText.isEmpty()) {
+            return logTextOutput(lastRecognizedText);
+        }
+        return false;
+    }
+    
+    /**
+     * Log the last recognized text with specified priority
+     * 
+     * @param priority Log priority level (use constants from android.util.Log)
+     * @return true if logging succeeded, false if there was no text to log
+     */
+    public boolean logLastRecognizedText(int priority) {
+        if (lastRecognizedText != null && !lastRecognizedText.isEmpty()) {
+            return logTextOutput(lastRecognizedText, priority);
+        }
+        return false;
     }
     
     // WakeupDetectorCallback implementation
@@ -318,6 +459,19 @@ public class WakeupDetectorService implements WakeupDetectorCallback {
         // Dispatch to all callbacks on main thread
         mainHandler.post(() -> {
             Log.i(TAG, "Wake word detected: " + wakeWord);
+            
+            // Always mark wake word as detected, regardless of current voice activity state
+            wakeWordDetectedDuringVoiceActivity = true;
+            detectedWakeWord = wakeWord;
+            
+            // Start voice activity capture immediately when wake word is detected
+            isCapturingVoiceActivity = true;
+            voiceActivityBuffer.clear();
+            capturedSamplesCount = 0;
+            
+            // Enable VAD in the native detector to start listening for voice activity
+            detector.enableVAD(true);
+            
             for (WakeupDetectorCallback callback : new ArrayList<>(callbacks)) {
                 callback.onWakeWordDetected(wakeWord);
             }
@@ -340,8 +494,16 @@ public class WakeupDetectorService implements WakeupDetectorCallback {
     @Override
     public void onVoiceActivityStarted() {
         Log.d("VADDebug", "Voice activity STARTED detected");
+        
+        // We should already have capture started from onWakeWordDetected
+        // but this is a safety check in case VAD starts before wake word detection
+        if (!isCapturingVoiceActivity) {
+            isCapturingVoiceActivity = true;
+            // We don't clear the buffer here as it might contain audio from the wake word
+        }
+        
         mainHandler.post(() -> {
-            for (WakeupDetectorCallback callback : callbacks) {
+            for (WakeupDetectorCallback callback : new ArrayList<>(callbacks)) {
                 callback.onVoiceActivityStarted();
             }
         });
@@ -350,10 +512,74 @@ public class WakeupDetectorService implements WakeupDetectorCallback {
     @Override
     public void onVoiceActivityEnded() {
         Log.d("VADDebug", "Voice activity ENDED detected");
+        
+        // Process captured audio if a wake word was detected during this voice activity
+        if (wakeWordDetectedDuringVoiceActivity && !voiceActivityBuffer.isEmpty()) {
+            Log.d(TAG, "Processing voice activity audio - captured " + capturedSamplesCount + " samples with wake word: " + detectedWakeWord);
+            // Stop capturing before processing to prevent additional audio being added during processing
+            isCapturingVoiceActivity = false;
+            processVoiceActivityAudio();
+            // Reset wake word flag after processing
+            wakeWordDetectedDuringVoiceActivity = false;
+        } else {
+            // Clear the buffer if no wake word was detected
+            Log.d(TAG, "No wake word was detected during voice activity or buffer is empty (wakeWordDetected=" + 
+                   wakeWordDetectedDuringVoiceActivity + ", bufferEmpty=" + voiceActivityBuffer.isEmpty() + 
+                   ", capturedSamples=" + capturedSamplesCount + ")");
+            voiceActivityBuffer.clear();
+            capturedSamplesCount = 0;
+            isCapturingVoiceActivity = false;
+            wakeWordDetectedDuringVoiceActivity = false;
+        }
+        
         mainHandler.post(() -> {
-            for (WakeupDetectorCallback callback : callbacks) {
+            for (WakeupDetectorCallback callback : new ArrayList<>(callbacks)) {
                 callback.onVoiceActivityEnded();
             }
+        });
+    }
+    
+    /**
+     * Process the audio captured during voice activity and send to Azure Speech
+     */
+    private void processVoiceActivityAudio() {
+        // Calculate total audio size
+        int totalSize = capturedSamplesCount;
+        if (totalSize <= 0) {
+            Log.w(TAG, "No voice activity audio captured");
+            return;
+        }
+        
+        Log.d(TAG, "Processing voice activity audio: combining " + voiceActivityBuffer.size() + 
+              " chunks into " + totalSize + " samples");
+        
+        // Create a single audio buffer from all captured chunks
+        short[] capturedAudio = new short[totalSize];
+        int position = 0;
+        
+        // Copy all buffer chunks into the single array
+        for (short[] chunk : voiceActivityBuffer) {
+            int chunkSize = Math.min(chunk.length, totalSize - position);
+            if (chunkSize <= 0) break;
+            
+            System.arraycopy(chunk, 0, capturedAudio, position, chunkSize);
+            position += chunkSize;
+        }
+        
+        Log.d(TAG, "Audio processing complete: combined " + position + " of " + totalSize + 
+              " samples, sending to onAudioCaptureCompleted");
+              
+        final short[] finalAudio = capturedAudio;
+        // Ensure wakeWord is never null - use a placeholder if needed
+        final String finalWakeWord = detectedWakeWord != null ? detectedWakeWord : "unknown";
+        
+        // Clear buffers
+        voiceActivityBuffer.clear();
+        capturedSamplesCount = 0;
+        
+        // Send the captured audio for processing
+        mainHandler.post(() -> {
+            onAudioCaptureCompleted(finalWakeWord, finalAudio, SAMPLE_RATE);
         });
     }
     
@@ -371,7 +597,19 @@ public class WakeupDetectorService implements WakeupDetectorCallback {
             if (speechRecognizer != null) {
                 try {
                     Log.i(TAG, "Sending captured audio to Azure Speech SDK");
-                    speechRecognizer.recognizeSpeech(audioData, sampleRate);
+                    
+                    // Add extra debugging to track if this is actually being called
+                    if (audioData != null && audioData.length > 0) {
+                        Log.d(TAG, "Audio data is valid: " + audioData.length + " samples");
+                        
+                        // Check if we have any listeners registered
+                        Log.d(TAG, "Number of speech recognition listeners: " + speechListeners.size());
+                        
+                        // Start the recognition process
+                        speechRecognizer.recognizeSpeech(audioData, sampleRate);
+                    } else {
+                        Log.e(TAG, "Audio data is invalid or empty");
+                    }
                 } catch (Exception e) {
                     Log.e(TAG, "Error sending audio to Azure Speech SDK", e);
                 }
@@ -380,8 +618,6 @@ public class WakeupDetectorService implements WakeupDetectorCallback {
             }
         });
     }
-    
-
     
     /**
      * Copy an asset file to internal storage

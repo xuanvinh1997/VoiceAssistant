@@ -8,7 +8,9 @@
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "WakeupDetector", __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "WakeupDetector", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "WakeupDetector", __VA_ARGS__)
-
+// JNI helper functions for voice activity callback
+static jmethodID onVoiceActivityStartedMethod = nullptr;
+static jmethodID onVoiceActivityEndedMethod = nullptr;
 // Global callback to pass data from C++ to Java
 static JavaVM* javaVM = nullptr;
 static jweak wakeupDetectorCallback = nullptr;
@@ -166,6 +168,15 @@ bool WakeupDetector::start(std::function<void(const std::string&)> callback) {
             feature.clear();
         }
         
+        // Reset VAD state if initialized
+        if (vadInitialized) {
+            vadSamples.clear();
+            vadSamplesReady = false;
+            vadEnabled = true;
+            isVoiceDetected = false;
+            previousVoiceState = false;
+        }
+        
         // Start threads
         melThread = std::thread(&WakeupDetector::audioToMels, this);
         featuresThread = std::thread(&WakeupDetector::melsToFeatures, this);
@@ -173,6 +184,12 @@ bool WakeupDetector::start(std::function<void(const std::string&)> callback) {
         wwThreads.clear();
         for (size_t i = 0; i < wwModelPaths.size(); i++) {
             wwThreads.emplace_back(&WakeupDetector::featuresToOutput, this, i);
+        }
+        
+        // Start VAD processing thread if initialized
+        if (vadInitialized) {
+            vadThread = std::thread(&WakeupDetector::vadProcessing, this);
+            LOGI("VAD processing thread started");
         }
         
         LOGI("WakeupDetector started successfully");
@@ -221,15 +238,49 @@ void WakeupDetector::stop() {
         if (thread.joinable()) thread.join();
     }
     
+    // Join VAD thread if joinable
+    if (vadThread.joinable()) {
+        vadThread.join();
+    }
+    
     LOGI("WakeupDetector stopped");
 }
 
+// Notify that voice activity has ended
+void notifyVoiceActivityEnded() {
+    JNIEnv* env;
+    bool detach = false;
+    int getEnvStat = javaVM->GetEnv((void**)&env, JNI_VERSION_1_6);
+
+    if (getEnvStat == JNI_EDETACHED) {
+        javaVM->AttachCurrentThread(&env, nullptr);
+        detach = true;
+    }
+
+    if (env && wakeupDetectorCallback && onVoiceActivityEndedMethod) {
+        jobject callback = env->NewLocalRef(wakeupDetectorCallback);
+        if (callback) {
+            env->CallVoidMethod(callback, onVoiceActivityEndedMethod);
+            env->DeleteLocalRef(callback);
+
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+    }
+
+    if (detach) {
+        javaVM->DetachCurrentThread();
+    }
+}
 // Process audio data
 void WakeupDetector::processAudio(const int16_t* audioData, size_t numSamples) {
     if (!isRunning || !audioData || numSamples == 0) {
         return;
     }
     
+    // Process for wake word detection
     std::unique_lock<std::mutex> lockSamples(mutSamples);
     
     // Convert int16_t samples to float and add to buffer
@@ -239,6 +290,36 @@ void WakeupDetector::processAudio(const int16_t* audioData, size_t numSamples) {
     
     samplesReady = true;
     cvSamples.notify_one();
+    
+    // Process for VAD if enabled
+    if (vadInitialized && vadEnabled) {
+        std::unique_lock<std::mutex> lockVAD(mutVAD);
+        
+        // Convert int16_t samples to float for VAD processing
+        for (size_t i = 0; i < numSamples; i++) {
+            // Normalize to float [-1.0, 1.0] range for VAD
+            vadSamples.push_back(static_cast<float>(audioData[i]) / 32768.0f);
+        }
+        
+        // Handle delayed voice activity end notification
+        if (voiceEndPending.load()) {
+            voiceEndFrameCount++;
+            
+            // Check if we've reached the delay threshold (500ms)
+            if (voiceEndFrameCount >= voiceEndDelayFrames) {
+                LOGD("Voice activity ended after delay - sending notification");
+                // Reset flags
+                isVoiceDetected = false;
+                voiceEndPending = false;
+                voiceEndFrameCount = 0;
+                // Notify voice activity ended through JNI
+                notifyVoiceActivityEnded();
+            }
+        }
+        
+        vadSamplesReady = true;
+        cvVAD.notify_one();
+    }
 }
 
 // Audio to mel spectrogram conversion thread
@@ -543,6 +624,163 @@ void WakeupDetector::featuresToOutput(size_t wwIdx) {
     LOGI("featuresToOutput thread %zu exiting", wwIdx);
 }
 
+// VAD processing thread
+void WakeupDetector::vadProcessing() {
+    LOGI("VAD processing thread started");
+    
+    if (!vadIterator) {
+        LOGE("VAD processor not initialized");
+        return;
+    }
+    
+    // Process audio in chunks
+    std::vector<float> audioChunk;
+    const size_t chunkSize = 512; // 32ms at 16kHz (same as vadIterator window size)
+    
+    try {
+        while (isRunning) {
+            {
+                std::unique_lock<std::mutex> lockVAD(mutVAD);
+                cvVAD.wait(lockVAD, [this] { 
+                    return vadSamplesReady || !isRunning; 
+                });
+                
+                if (!isRunning) break;
+                
+                // Copy samples to processing buffer
+                audioChunk = vadSamples;
+                vadSamples.clear();
+                vadSamplesReady = false;
+            }
+            
+            if (audioChunk.size() >= chunkSize) {
+                // Process each chunk
+                for (size_t offset = 0; offset + chunkSize <= audioChunk.size() && isRunning; offset += chunkSize) {
+                    std::vector<float> chunk(audioChunk.begin() + offset, audioChunk.begin() + offset + chunkSize);
+                    vadIterator->predict(chunk);
+                }
+            }
+        }
+    } catch (const std::exception& e) {
+        LOGE("Error in VAD processing: %s", e.what());
+    }
+    
+    LOGI("VAD processing thread exiting");
+}
+
+
+
+// Notify that voice activity has started
+void notifyVoiceActivityStarted() {
+    JNIEnv* env;
+    bool detach = false;
+    int getEnvStat = javaVM->GetEnv((void**)&env, JNI_VERSION_1_6);
+    
+    if (getEnvStat == JNI_EDETACHED) {
+        javaVM->AttachCurrentThread(&env, nullptr);
+        detach = true;
+    }
+    
+    if (env && wakeupDetectorCallback && onVoiceActivityStartedMethod) {
+        jobject callback = env->NewLocalRef(wakeupDetectorCallback);
+        if (callback) {
+            env->CallVoidMethod(callback, onVoiceActivityStartedMethod);
+            env->DeleteLocalRef(callback);
+            
+            if (env->ExceptionCheck()) {
+                env->ExceptionDescribe();
+                env->ExceptionClear();
+            }
+        }
+    }
+    
+    if (detach) {
+        javaVM->DetachCurrentThread();
+    }
+}
+
+
+// Initialize VAD with model path
+bool WakeupDetector::initializeVAD(const std::string& vadModelPath) {
+    LOGI("Initializing VAD with model: %s", vadModelPath.c_str());
+    
+    this->vadModelPath = vadModelPath;
+    
+    try {
+        // Create VAD Iterator
+        vadIterator = std::make_unique<VadIterator>(
+            vadModelPath,               // Model path
+            vadSampleRate,              // Sample rate (16kHz)
+            32,                         // Window size in ms (512 samples)
+            vadThreshold,               // Threshold (0.5)
+            100,                        // Min silence duration ms
+            30,                         // Speech padding ms
+            250,                        // Min speech duration ms
+            30.0f                       // Max speech duration seconds
+        );
+        
+        // Setup VAD callback with 0.5 second delay for voice end detection
+        vadIterator->set_callback([this](bool isSpeaking) {
+            // Update the voice detection state
+            bool previousState = previousVoiceState.exchange(isVoiceDetected);
+            
+            if (isSpeaking) {
+                // If state changed to speaking
+                if (!previousState) {
+                    LOGD("Voice activity started");
+                    isVoiceDetected = true;
+                    // Cancel any pending voice end notification
+                    voiceEndPending = false;
+                    voiceEndFrameCount = 0;
+                    // Notify voice activity started through JNI
+                    notifyVoiceActivityStarted();
+                }
+            } else {
+                // If we were speaking but now we're not, start the delay
+                if (isVoiceDetected) {
+                    // Don't immediately mark as not speaking, instead flag for delayed notification
+                    voiceEndPending = true;
+                    voiceEndFrameCount = 0;
+                    LOGD("Voice activity potentially ending - starting delay");
+                }
+            }
+        });
+        
+        vadInitialized = true;
+        LOGI("VAD initialized successfully");
+        return true;
+    } catch (const std::exception& e) {
+        LOGE("Error initializing VAD: %s", e.what());
+        return false;
+    }
+}
+
+// Enable or disable VAD
+bool WakeupDetector::enableVAD(bool enable) {
+    if (!vadInitialized) {
+        LOGE("Cannot enable VAD: VAD not initialized");
+        return false;
+    }
+    
+    LOGI("Setting VAD enabled: %s", enable ? "true" : "false");
+    vadEnabled = enable;
+    
+    // If VAD is being disabled, reset the state
+    if (!enable) {
+        isVoiceDetected = false;
+        previousVoiceState = false;
+        voiceEndPending = false;
+        voiceEndFrameCount = 0;
+        
+        // Clear VAD samples buffer
+        std::unique_lock<std::mutex> lockVAD(mutVAD);
+        vadSamples.clear();
+        vadSamplesReady = false;
+    }
+    
+    return true;
+}
+
 // JNI implementation
 extern "C" {
 
@@ -568,13 +806,26 @@ JNIEXPORT jint JNI_OnLoad(JavaVM* vm, void* reserved) {
     }
     
     // Get the onDetectionScoreUpdate method ID
-    onDetectionScoreUpdateMethod = env->GetMethodID(callbackClass, "onDetectionScoreUpdate", "(Ljava/lang/String;FFII)V");
+    onDetectionScoreUpdateMethod = env->GetMethodID(callbackClass, "onDetectionScoreUpdate", 
+                                                  "(Ljava/lang/String;FFII)V");
     if (onDetectionScoreUpdateMethod == nullptr) {
         LOGE("Failed to find onDetectionScoreUpdate method");
         return JNI_ERR;
     }
     
-    env->DeleteLocalRef(callbackClass);
+    // Get the onVoiceActivityStarted method ID
+    onVoiceActivityStartedMethod = env->GetMethodID(callbackClass, "onVoiceActivityStarted", "()V");
+    if (onVoiceActivityStartedMethod == nullptr) {
+        LOGE("Failed to find onVoiceActivityStarted method");
+        // Non-fatal - continue with initialization
+    }
+    
+    // Get the onVoiceActivityEnded method ID
+    onVoiceActivityEndedMethod = env->GetMethodID(callbackClass, "onVoiceActivityEnded", "()V");
+    if (onVoiceActivityEndedMethod == nullptr) {
+        LOGE("Failed to find onVoiceActivityEnded method");
+        // Non-fatal - continue with initialization
+    }
     
     return JNI_VERSION_1_6;
 }
@@ -673,6 +924,29 @@ JNIEXPORT void JNICALL Java_com_vinhpx_voiceassistant_WakeupDetectorJNI_destroyW
         env->DeleteWeakGlobalRef(wakeupDetectorCallback);
         wakeupDetectorCallback = nullptr;
     }
+}
+
+JNIEXPORT jboolean JNICALL Java_com_vinhpx_voiceassistant_WakeupDetectorJNI_initializeVAD(
+        JNIEnv* env, jobject thiz, jlong detectorPtr, jstring vadModelPath) {
+    auto* detector = reinterpret_cast<WakeupDetector*>(detectorPtr);
+    if (!detector) return JNI_FALSE;
+    
+    // Convert Java string to C++ string
+    const char* vadModelChars = env->GetStringUTFChars(vadModelPath, nullptr);
+    std::string vadModelStr(vadModelChars);
+    env->ReleaseStringUTFChars(vadModelPath, vadModelChars);
+    
+    // Initialize VAD with the model path
+    return detector->initializeVAD(vadModelStr) ? JNI_TRUE : JNI_FALSE;
+}
+
+JNIEXPORT jboolean JNICALL Java_com_vinhpx_voiceassistant_WakeupDetectorJNI_enableVAD(
+        JNIEnv* env, jobject thiz, jlong detectorPtr, jboolean enabled) {
+    auto* detector = reinterpret_cast<WakeupDetector*>(detectorPtr);
+    if (!detector) return JNI_FALSE;
+    
+    // Call the enableVAD method
+    return detector->enableVAD(enabled) ? JNI_TRUE : JNI_FALSE;
 }
 
 } // extern "C"

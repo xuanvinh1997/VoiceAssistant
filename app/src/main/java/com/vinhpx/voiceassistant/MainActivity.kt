@@ -117,11 +117,18 @@ class MainActivity : AppCompatActivity(), WakeupDetectorCallback {
         val embModelName = "models/embedding_model.onnx"
         val wakeWordModels = arrayOf("models/alexa_v0.1.onnx")
         
-        // Add VAD model initialization check
+        // Add VAD model initialization
         val vadModelName = "models/vad.onnx"
         Log.d("VADDebug", "VAD model path: $vadModelName")
         
         if (wakeupDetectorService.initialize(melModelName, embModelName, wakeWordModels)) {
+            // Initialize VAD model
+            if (wakeupDetectorService.initializeVAD(vadModelName)) {
+                Log.d("VADDebug", "VAD model initialized successfully")
+            } else {
+                Log.e("VADDebug", "Failed to initialize VAD model")
+                binding.statusText.text = "Note: VAD not available."
+            }
 
             if (wakeupDetectorService.start()) {
                 isDetectionRunning = true

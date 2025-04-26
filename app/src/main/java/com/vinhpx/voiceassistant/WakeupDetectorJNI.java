@@ -33,7 +33,15 @@ public class WakeupDetectorJNI implements WakeupDetectorCallback {
         return initializeDetector(nativeDetectorPtr, melModelPath, embModelPath, wwModelPaths);
     }
     
-
+    /**
+     * Initialize the VAD detector with model path
+     * 
+     * @param vadModelPath Path to the VAD (Voice Activity Detection) ONNX model
+     * @return true if initialization succeeded
+     */
+    public boolean initializeVAD(String vadModelPath) {
+        return initializeVAD(nativeDetectorPtr, vadModelPath);
+    }
 
     /**
      * Start the detector
@@ -114,14 +122,24 @@ public class WakeupDetectorJNI implements WakeupDetectorCallback {
         }
     }
     
+    /**
+     * Enable or disable VAD processing
+     *
+     * @param enabled True to enable VAD, false to disable
+     * @return true if the operation was successful
+     */
+    public boolean enableVAD(boolean enabled) {
+        return enableVAD(nativeDetectorPtr, enabled);
+    }
+
     // Native methods - implemented in C++
     private native long createWakeupDetector();
     private native boolean initializeDetector(long detectorPtr, String melModelPath, 
                                             String embModelPath, String[] wwModelPaths);
-//    private native boolean initializeVAD(long detectorPtr, String vadModelPath);
+    private native boolean initializeVAD(long detectorPtr, String vadModelPath);
     private native boolean startDetector(long detectorPtr);
     private native void stopDetector(long detectorPtr);
     private native void processAudio(long detectorPtr, short[] audioData, int numSamples);
+    private native boolean enableVAD(long detectorPtr, boolean enabled);
     private native void destroyWakeupDetector(long detectorPtr);
-
 }

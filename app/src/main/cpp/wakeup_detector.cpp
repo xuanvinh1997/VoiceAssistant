@@ -8,6 +8,7 @@
 #define LOGD(...) __android_log_print(ANDROID_LOG_DEBUG, "WakeupDetector", __VA_ARGS__)
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "WakeupDetector", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "WakeupDetector", __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, "WakeupDetector", __VA_ARGS__)
 // JNI helper functions for voice activity callback
 static jmethodID onVoiceActivityStartedMethod = nullptr;
 static jmethodID onVoiceActivityEndedMethod = nullptr;
@@ -209,41 +210,136 @@ void WakeupDetector::stop() {
     
     LOGI("Stopping WakeupDetector");
     
+    // Set running flag to false first to signal all threads they should exit
     isRunning = false;
     
-    // Wake up all threads to check isRunning and exit
-    {
-        std::unique_lock<std::mutex> lockSamples(mutSamples);
-        samplesReady = true;
-        cvSamples.notify_one();
+    // Make sure VAD is disabled to prevent any callbacks during shutdown
+    if (vadInitialized) {
+        vadEnabled = false;
     }
     
-    {
-        std::unique_lock<std::mutex> lockMels(mutMels);
-        melsReady = true;
-        cvMels.notify_one();
+    // Wake up all threads to check isRunning and exit by notifying ALL threads waiting
+    try {
+        // Notify mel thread
+        {
+            std::unique_lock<std::mutex> lockSamples(mutSamples);
+            samplesReady = true;
+            cvSamples.notify_all();  // Notify all threads waiting on this condition
+        }
+        
+        // Notify features thread
+        {
+            std::unique_lock<std::mutex> lockMels(mutMels);
+            melsReady = true;
+            cvMels.notify_all();  // Notify all threads waiting on this condition
+        }
+        
+        // Notify all wake word model threads
+        for (size_t i = 0; i < featuresReady.size(); i++) {
+            std::unique_lock<std::mutex> lockFeatures(mutFeatures[i]);
+            featuresReady[i] = true;
+            cvFeatures[i].notify_all();  // Notify all threads waiting on this condition
+        }
+        
+        // Notify VAD thread if it exists
+        if (vadInitialized) {
+            std::unique_lock<std::mutex> lockVAD(mutVAD);
+            vadSamplesReady = true;
+            cvVAD.notify_all();  // Notify all threads waiting on this condition
+        }
+        
+        // Define timeout values for thread joins
+        const int JOIN_TIMEOUT_MS = 2000;  // 2 seconds timeout
+        
+        // Join threads with timeouts to prevent deadlocks
+        if (melThread.joinable()) {
+            if (joinThreadWithTimeout(melThread, JOIN_TIMEOUT_MS)) {
+                LOGI("Mel thread joined successfully");
+            } else {
+                LOGW("Mel thread join timed out after %d ms", JOIN_TIMEOUT_MS);
+            }
+        }
+        
+        if (featuresThread.joinable()) {
+            if (joinThreadWithTimeout(featuresThread, JOIN_TIMEOUT_MS)) {
+                LOGI("Features thread joined successfully");
+            } else {
+                LOGW("Features thread join timed out after %d ms", JOIN_TIMEOUT_MS);
+            }
+        }
+        
+        // Join wake word threads
+        for (size_t i = 0; i < wwThreads.size(); i++) {
+            if (wwThreads[i].joinable()) {
+                if (joinThreadWithTimeout(wwThreads[i], JOIN_TIMEOUT_MS)) {
+                    LOGI("Wake word thread %zu joined successfully", i);
+                } else {
+                    LOGW("Wake word thread %zu join timed out after %d ms", i, JOIN_TIMEOUT_MS);
+                }
+            }
+        }
+        
+        // Join VAD thread if joinable
+        if (vadThread.joinable()) {
+            if (joinThreadWithTimeout(vadThread, JOIN_TIMEOUT_MS)) {
+                LOGI("VAD thread joined successfully");
+            } else {
+                LOGW("VAD thread join timed out after %d ms", JOIN_TIMEOUT_MS);
+            }
+        }
+    }
+    catch (const std::exception& e) {
+        LOGE("Error during detector shutdown: %s", e.what());
     }
     
-    for (size_t i = 0; i < featuresReady.size(); i++) {
-        std::unique_lock<std::mutex> lockFeatures(mutFeatures[i]);
-        featuresReady[i] = true;
-        cvFeatures[i].notify_one();
+    // Clear any pending data to prevent processing during shutdown
+    floatSamples.clear();
+    mels.clear();
+    for (auto& feature : features) {
+        feature.clear();
     }
-    
-    // Join threads
-    if (melThread.joinable()) melThread.join();
-    if (featuresThread.joinable()) featuresThread.join();
-    
-    for (auto& thread : wwThreads) {
-        if (thread.joinable()) thread.join();
-    }
-    
-    // Join VAD thread if joinable
-    if (vadThread.joinable()) {
-        vadThread.join();
-    }
+    vadSamples.clear();
     
     LOGI("WakeupDetector stopped");
+}
+
+// Helper function to join a thread with timeout
+bool WakeupDetector::joinThreadWithTimeout(std::thread& thread, int timeoutMs) {
+    if (!thread.joinable()) return true;
+    
+    // Try to join the thread normally for a short time
+    auto start = std::chrono::steady_clock::now();
+    
+    // Use a separate thread to join with timeout
+    std::thread joiner = std::thread([&thread]() {
+        thread.join();
+    });
+    
+    // Wait for short time (timeoutMs)
+    if (joiner.joinable()) {
+        auto status = std::cv_status::no_timeout;
+        {
+            std::mutex m;
+            std::unique_lock<std::mutex> lock(m);
+            std::condition_variable cv;
+            status = cv.wait_for(lock, std::chrono::milliseconds(timeoutMs));
+        }
+        
+        // If the joiner thread is still running (didn't join in time)
+        if (status == std::cv_status::timeout) {
+            // We can't actually terminate a thread safely in C++
+            // Just detach the joiner thread and return false
+            joiner.detach();
+            return false;
+        }
+        else {
+            // Join completed in time
+            joiner.join();
+            return true;
+        }
+    }
+    
+    return true;
 }
 
 // Notify that voice activity has ended
@@ -763,20 +859,46 @@ bool WakeupDetector::enableVAD(bool enable) {
     }
     
     LOGI("Setting VAD enabled: %s", enable ? "true" : "false");
-    vadEnabled = enable;
     
-    // If VAD is being disabled, reset the state
-    if (!enable) {
+    // If we're enabling VAD, make sure states are reset
+    if (enable) {
+        // Reset VAD iterator's internal state for a fresh start
+        if (vadIterator) {
+            vadIterator->reset();
+            LOGI("VAD state reset");
+        }
+
+        // Reset VAD states
         isVoiceDetected = false;
         previousVoiceState = false;
         voiceEndPending = false;
         voiceEndFrameCount = 0;
         
         // Clear VAD samples buffer
-        std::unique_lock<std::mutex> lockVAD(mutVAD);
-        vadSamples.clear();
-        vadSamplesReady = false;
+        {
+            std::unique_lock<std::mutex> lockVAD(mutVAD);
+            vadSamples.clear();
+            vadSamplesReady = false;
+        }
+    } 
+    // If we're disabling VAD
+    else {
+        // Reset states related to voice activity
+        isVoiceDetected = false;
+        previousVoiceState = false;
+        voiceEndPending = false;
+        voiceEndFrameCount = 0;
+        
+        // Clear VAD samples buffer
+        {
+            std::unique_lock<std::mutex> lockVAD(mutVAD);
+            vadSamples.clear();
+            vadSamplesReady = false;
+        }
     }
+    
+    // Set the enabled state after all cleanup
+    vadEnabled = enable;
     
     return true;
 }

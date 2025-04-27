@@ -475,4 +475,7 @@ public:
     size_t vadInputLength = 0;
     // Callback for audio capture completion
     std::function<void(const std::vector<int16_t>&, int)> audioCaptureCallback;
+
+    // Helper function to join threads with timeout
+    bool joinThreadWithTimeout(std::thread& thread, int timeoutMs);
 };

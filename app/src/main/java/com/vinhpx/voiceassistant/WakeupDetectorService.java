@@ -240,36 +240,93 @@ public class WakeupDetectorService implements WakeupDetectorCallback {
      * Stop wake word detection
      */
     public void stop() {
+        Log.i(TAG, "Stopping WakeupDetectorService");
+        
+        // Set recording flag to false first to signal processing thread to stop
         isRecording.set(false);
         
-        // Stop native detector
-        detector.stop();
-        
-        // Stop and release AudioRecord
-        if (audioRecord != null) {
-            if (audioRecord.getState() == AudioRecord.STATE_INITIALIZED) {
-                try {
-                    audioRecord.stop();
-                } catch (IllegalStateException e) {
-                    Log.w(TAG, "AudioRecord was not recording", e);
-                }
-            }
-            audioRecord.release();
-            audioRecord = null;
-        }
-        
-        // Wait for recording thread to finish
-        if (recordingThread != null) {
+        // Create a background thread to handle stopping to prevent UI freezes
+        Thread stopThread = new Thread(() -> {
             try {
-                recordingThread.join(1000);
-            } catch (InterruptedException e) {
-                Log.w(TAG, "Interrupted while waiting for recording thread", e);
-                Thread.currentThread().interrupt();
+                // Stop native detector with timeout protection
+                boolean success = stopDetectorWithTimeout();
+                
+                // Now handle the AudioRecord on the background thread
+                if (audioRecord != null) {
+                    if (audioRecord.getState() == AudioRecord.STATE_INITIALIZED) {
+                        try {
+                            audioRecord.stop();
+                        } catch (IllegalStateException e) {
+                            Log.w(TAG, "AudioRecord was not recording", e);
+                        }
+                    }
+                    audioRecord.release();
+                    audioRecord = null;
+                }
+                
+                // Wait for recording thread to finish with a timeout
+                if (recordingThread != null) {
+                    try {
+                        recordingThread.join(1000);  // 1 second timeout
+                    } catch (InterruptedException e) {
+                        Log.w(TAG, "Interrupted while waiting for recording thread", e);
+                        Thread.currentThread().interrupt();
+                    }
+                    
+                    // If thread is still alive after timeout, it's likely stuck
+                    if (recordingThread.isAlive()) {
+                        Log.w(TAG, "Recording thread did not exit cleanly, may be stuck");
+                    }
+                    recordingThread = null;
+                }
+                
+                // Update UI on main thread
+                mainHandler.post(() -> {
+                    Log.i(TAG, "WakeupDetectorService stopped " + 
+                          (success ? "successfully" : "with possible issues"));
+                });
+            } catch (Exception e) {
+                Log.e(TAG, "Error while stopping WakeupDetectorService", e);
             }
-            recordingThread = null;
+        });
+        
+        stopThread.start();
+    }
+    
+    /**
+     * Stop the detector with a timeout to prevent blocking indefinitely
+     * 
+     * @return true if the detector was stopped successfully, false if it timed out
+     */
+    private boolean stopDetectorWithTimeout() {
+        // Create a future to handle the stop operation with a timeout
+        final AtomicBoolean completed = new AtomicBoolean(false);
+        
+        Thread stopDetectorThread = new Thread(() -> {
+            try {
+                detector.stop();
+                completed.set(true);
+            } catch (Exception e) {
+                Log.e(TAG, "Error stopping native detector", e);
+            }
+        });
+        
+        // Start the thread and wait with timeout
+        stopDetectorThread.start();
+        try {
+            stopDetectorThread.join(3000); // 3 second timeout should be enough
+        } catch (InterruptedException e) {
+            Log.w(TAG, "Interrupted while stopping native detector", e);
+            Thread.currentThread().interrupt();
         }
         
-        Log.i(TAG, "WakeupDetectorService stopped");
+        // Check if operation completed or timed out
+        if (!completed.get()) {
+            Log.e(TAG, "Native detector stop operation timed out! App may be unstable.");
+            return false;
+        }
+        
+        return true;
     }
     
     /**
@@ -460,17 +517,24 @@ public class WakeupDetectorService implements WakeupDetectorCallback {
         mainHandler.post(() -> {
             Log.i(TAG, "Wake word detected: " + wakeWord);
             
-            // Always mark wake word as detected, regardless of current voice activity state
+            // Reset any previous state to ensure clean capture
+            voiceActivityBuffer.clear();
+            capturedSamplesCount = 0;
+
+            // Store wake word information for later processing
             wakeWordDetectedDuringVoiceActivity = true;
             detectedWakeWord = wakeWord;
             
-            // Start voice activity capture immediately when wake word is detected
+            // Start voice activity capture immediately
             isCapturingVoiceActivity = true;
-            voiceActivityBuffer.clear();
-            capturedSamplesCount = 0;
+            
+            // First disable VAD to reset its state, then re-enable it
+            detector.enableVAD(false);
             
             // Enable VAD in the native detector to start listening for voice activity
             detector.enableVAD(true);
+            
+            Log.d(TAG, "Voice capture started after wake word, waiting for speech...");
             
             for (WakeupDetectorCallback callback : new ArrayList<>(callbacks)) {
                 callback.onWakeWordDetected(wakeWord);
@@ -495,11 +559,16 @@ public class WakeupDetectorService implements WakeupDetectorCallback {
     public void onVoiceActivityStarted() {
         Log.d("VADDebug", "Voice activity STARTED detected");
         
-        // We should already have capture started from onWakeWordDetected
-        // but this is a safety check in case VAD starts before wake word detection
-        if (!isCapturingVoiceActivity) {
-            isCapturingVoiceActivity = true;
-            // We don't clear the buffer here as it might contain audio from the wake word
+        // Only start capturing if a wake word was previously detected
+        // This ensures we're only capturing and recognizing speech that follows a wake word
+        if (wakeWordDetectedDuringVoiceActivity) {
+            if (!isCapturingVoiceActivity) {
+                Log.d(TAG, "Starting voice activity capture after wake word detection");
+                isCapturingVoiceActivity = true;
+                // We don't clear the buffer here as it might contain audio from the wake word
+            }
+        } else {
+            Log.d(TAG, "Voice activity detected but no wake word was detected first, ignoring");
         }
         
         mainHandler.post(() -> {
@@ -514,28 +583,52 @@ public class WakeupDetectorService implements WakeupDetectorCallback {
         Log.d("VADDebug", "Voice activity ENDED detected");
         
         // Process captured audio if a wake word was detected during this voice activity
-        if (wakeWordDetectedDuringVoiceActivity && !voiceActivityBuffer.isEmpty()) {
-            Log.d(TAG, "Processing voice activity audio - captured " + capturedSamplesCount + " samples with wake word: " + detectedWakeWord);
+        // and we have some audio data captured
+        if (wakeWordDetectedDuringVoiceActivity && !voiceActivityBuffer.isEmpty() && capturedSamplesCount > 0) {
+            Log.d(TAG, "Processing voice activity audio - captured " + capturedSamplesCount + 
+                  " samples after wake word: " + detectedWakeWord);
+            
             // Stop capturing before processing to prevent additional audio being added during processing
             isCapturingVoiceActivity = false;
+            
+            // Process the audio that was captured after the wake word
             processVoiceActivityAudio();
-            // Reset wake word flag after processing
-            wakeWordDetectedDuringVoiceActivity = false;
+            
+            // Disable VAD after processing to prevent false triggers
+            detector.enableVAD(false);
         } else {
-            // Clear the buffer if no wake word was detected
-            Log.d(TAG, "No wake word was detected during voice activity or buffer is empty (wakeWordDetected=" + 
-                   wakeWordDetectedDuringVoiceActivity + ", bufferEmpty=" + voiceActivityBuffer.isEmpty() + 
-                   ", capturedSamples=" + capturedSamplesCount + ")");
-            voiceActivityBuffer.clear();
-            capturedSamplesCount = 0;
-            isCapturingVoiceActivity = false;
-            wakeWordDetectedDuringVoiceActivity = false;
+            // Clear the buffer if no wake word was detected or no useful audio was captured
+            Log.d(TAG, "No usable voice activity after wake word detection (wakeWordDetected=" + 
+                  wakeWordDetectedDuringVoiceActivity + ", bufferEmpty=" + voiceActivityBuffer.isEmpty() + 
+                  ", capturedSamples=" + capturedSamplesCount + ")");
+            
+            // Disable VAD to avoid false triggers
+            detector.enableVAD(false);
         }
         
+        // Reset capture state regardless of outcome
+        voiceActivityBuffer.clear();
+        capturedSamplesCount = 0;
+        isCapturingVoiceActivity = false;
+        wakeWordDetectedDuringVoiceActivity = false;
+        
+        // Notify callbacks
         mainHandler.post(() -> {
             for (WakeupDetectorCallback callback : new ArrayList<>(callbacks)) {
                 callback.onVoiceActivityEnded();
             }
+            
+            // Re-enable wake word detection by resetting the detector state
+            // This allows it to detect wake words again
+            mainHandler.postDelayed(() -> {
+                Log.d(TAG, "Re-enabling wake word detection after voice activity ended");
+                // Re-initialize the detector's state to be ready for the next wake word
+                if (detector != null && isRecording.get()) {
+                    // Stop and restart wake word processing
+                    detector.stop();
+                    detector.start();
+                }
+            }, 500); // Small delay to ensure all processing is complete
         });
     }
     
